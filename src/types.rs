@@ -1,5 +1,40 @@
 use chrono::NaiveDate;
 
+/// Status of keyring initialization.
+///
+/// Returned by [`ReadOnlyKeyring::is_initialized`] to indicate the current
+/// state of the keyring directory without spawning GPG processes.
+///
+/// # Security Considerations
+///
+/// This method performs non-atomic filesystem checks and is subject to
+/// TOCTOU race conditions. The keyring state may change between the
+/// check and subsequent operations. Use this for informational purposes
+/// or pre-flight checks, not for security-critical decisions.
+///
+/// [`ReadOnlyKeyring::is_initialized`]: crate::ReadOnlyKeyring::is_initialized
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InitializationStatus {
+    /// Keyring is fully initialized and ready for use.
+    Ready,
+    /// The keyring directory does not exist.
+    DirectoryMissing,
+    /// Path exists but is a regular file, not a directory.
+    PathIsFile,
+    /// Path is a symbolic link (security risk - may point to untrusted location).
+    PathIsSymlink,
+    /// Directory exists but contains no keyring files (pubring.kbx or pubring.gpg).
+    NoKeyringFiles,
+    /// Directory exists but trustdb.gpg is missing.
+    NoTrustDb,
+    /// Directory exists but has incorrect permissions (should be 700).
+    IncorrectPermissions {
+        /// The actual permission bits (e.g., 0o755).
+        actual: u32,
+    },
+}
+
 /// A GPG key from the pacman keyring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
