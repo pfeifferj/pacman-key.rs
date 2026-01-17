@@ -534,7 +534,7 @@ impl Keyring {
             .spawn()?;
 
         let stderr = child.stderr.take().ok_or(Error::StderrCaptureFailed)?;
-        let mut reader = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
 
         let timeout_secs = timeout.map(|d| d.as_secs());
         let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
@@ -577,7 +577,7 @@ impl Keyring {
 
     async fn read_refresh_output<F>(
         &self,
-        reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+        reader: &mut BufReader<tokio::process::ChildStderr>,
         callback: &F,
         total: usize,
         deadline: Option<tokio::time::Instant>,
@@ -588,16 +588,19 @@ impl Keyring {
         F: Fn(RefreshProgress),
     {
         let mut current = 0;
+        let mut buf = Vec::new();
 
         loop {
-            let line_result = match (deadline, cancel_token) {
+            buf.clear();
+
+            let read_result = match (deadline, cancel_token) {
                 (Some(dl), Some(token)) => {
                     tokio::select! {
                         _ = token.cancelled() => return Err(Error::Cancelled),
                         _ = tokio::time::sleep_until(dl) => {
                             return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
                         }
-                        line = reader.next_line() => line,
+                        result = reader.read_until(b'\n', &mut buf) => result,
                     }
                 }
                 (Some(dl), None) => {
@@ -605,23 +608,29 @@ impl Keyring {
                         _ = tokio::time::sleep_until(dl) => {
                             return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
                         }
-                        line = reader.next_line() => line,
+                        result = reader.read_until(b'\n', &mut buf) => result,
                     }
                 }
                 (None, Some(token)) => {
                     tokio::select! {
                         _ = token.cancelled() => return Err(Error::Cancelled),
-                        line = reader.next_line() => line,
+                        result = reader.read_until(b'\n', &mut buf) => result,
                     }
                 }
-                (None, None) => reader.next_line().await,
+                (None, None) => reader.read_until(b'\n', &mut buf).await,
             };
 
-            let line = match line_result {
-                Ok(Some(l)) => l,
-                Ok(None) => break,
+            match read_result {
+                Ok(0) => break,
+                Ok(_) => {}
                 Err(e) => return Err(Error::Command(e)),
-            };
+            }
+
+            if buf.ends_with(b"\n") {
+                buf.pop();
+            }
+
+            let line = String::from_utf8_lossy(&buf).into_owned();
 
             if line.contains("refreshing") || line.contains("requesting") {
                 current += 1;
