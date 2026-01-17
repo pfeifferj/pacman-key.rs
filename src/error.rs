@@ -27,6 +27,9 @@ pub enum Error {
     #[error("operation timed out after {0} seconds")]
     Timeout(u64),
 
+    #[error("operation was cancelled")]
+    Cancelled,
+
     #[error("failed to capture stderr from subprocess")]
     StderrCaptureFailed,
 }

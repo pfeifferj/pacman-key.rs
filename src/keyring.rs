@@ -4,7 +4,9 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 use crate::parse::{parse_keys, parse_signatures};
-use crate::types::{InitializationStatus, Key, RefreshOptions, RefreshProgress, Signature};
+use crate::types::{
+    CancellationToken, InitializationStatus, Key, RefreshOptions, RefreshProgress, Signature,
+};
 use crate::validation::{validate_keyid, validate_keyring_name};
 
 const DEFAULT_GPG_HOMEDIR: &str = "/etc/pacman.d/gnupg";
@@ -375,14 +377,25 @@ impl Keyring {
     /// This is a long-running operation. The callback receives progress updates
     /// as keys are refreshed.
     ///
+    /// # Cancellation
+    ///
+    /// If a `cancel_token` is provided in options and gets cancelled, the
+    /// subprocess is terminated and `Error::Cancelled` is returned.
+    ///
     /// # Example
     ///
     /// ```no_run
     /// # async fn example() -> pacman_key::Result<()> {
-    /// use pacman_key::{Keyring, RefreshOptions, RefreshProgress};
+    /// use pacman_key::{Keyring, RefreshOptions, RefreshProgress, CancellationToken};
     ///
     /// let keyring = Keyring::new();
-    /// let options = RefreshOptions { timeout_secs: Some(300) };
+    /// let token = CancellationToken::new();
+    /// let options = RefreshOptions {
+    ///     timeout_secs: Some(300),
+    ///     cancel_token: Some(token.clone()),
+    /// };
+    ///
+    /// // Cancel from another task with: token.cancel()
     /// keyring.refresh_keys(|p| println!("{p:?}"), options).await?;
     /// # Ok(())
     /// # }
@@ -391,19 +404,19 @@ impl Keyring {
     where
         F: Fn(RefreshProgress),
     {
-        let refresh_future = self.refresh_keys_inner(&callback);
+        let timeout_duration = options.timeout_secs.map(std::time::Duration::from_secs);
+        let cancel_token = options.cancel_token;
 
-        match options.timeout_secs {
-            Some(secs) => {
-                tokio::time::timeout(std::time::Duration::from_secs(secs), refresh_future)
-                    .await
-                    .map_err(|_| Error::Timeout(secs))?
-            }
-            None => refresh_future.await,
-        }
+        self.refresh_keys_inner(&callback, timeout_duration, cancel_token)
+            .await
     }
 
-    async fn refresh_keys_inner<F>(&self, callback: &F) -> Result<()>
+    async fn refresh_keys_inner<F>(
+        &self,
+        callback: &F,
+        timeout: Option<std::time::Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<()>
     where
         F: Fn(RefreshProgress),
     {
@@ -422,8 +435,93 @@ impl Keyring {
         let stderr = child.stderr.take().ok_or(Error::StderrCaptureFailed)?;
         let mut reader = BufReader::new(stderr).lines();
 
+        let timeout_secs = timeout.map(|d| d.as_secs());
+        let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
+        let result = self
+            .read_refresh_output(
+                &mut reader,
+                callback,
+                total,
+                deadline,
+                timeout_secs,
+                &cancel_token,
+            )
+            .await;
+
+        // Drop reader to close stderr pipe before killing
+        drop(reader);
+
+        if result.is_err() {
+            if let Err(e) = child.start_kill() {
+                tracing::warn!("failed to kill subprocess: {}", e);
+            }
+            if let Err(e) = child.wait().await {
+                tracing::warn!("failed to wait for subprocess: {}", e);
+            }
+            return result;
+        }
+
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(Error::PacmanKey {
+                status: status.code().unwrap_or(-1),
+                stderr: "refresh failed".to_string(),
+            });
+        }
+
+        callback(RefreshProgress::Completed);
+        Ok(())
+    }
+
+    async fn read_refresh_output<F>(
+        &self,
+        reader: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+        callback: &F,
+        total: usize,
+        deadline: Option<tokio::time::Instant>,
+        timeout_secs: Option<u64>,
+        cancel_token: &Option<CancellationToken>,
+    ) -> Result<()>
+    where
+        F: Fn(RefreshProgress),
+    {
         let mut current = 0;
-        while let Some(line) = reader.next_line().await? {
+
+        loop {
+            let line_result = match (deadline, cancel_token) {
+                (Some(dl), Some(token)) => {
+                    tokio::select! {
+                        _ = token.cancelled() => return Err(Error::Cancelled),
+                        _ = tokio::time::sleep_until(dl) => {
+                            return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
+                        }
+                        line = reader.next_line() => line,
+                    }
+                }
+                (Some(dl), None) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(dl) => {
+                            return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
+                        }
+                        line = reader.next_line() => line,
+                    }
+                }
+                (None, Some(token)) => {
+                    tokio::select! {
+                        _ = token.cancelled() => return Err(Error::Cancelled),
+                        line = reader.next_line() => line,
+                    }
+                }
+                (None, None) => reader.next_line().await,
+            };
+
+            let line = match line_result {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => return Err(Error::Command(e)),
+            };
+
             if line.contains("refreshing") || line.contains("requesting") {
                 current += 1;
                 let keyid = extract_keyid_from_line(&line);
@@ -444,15 +542,6 @@ impl Keyring {
             }
         }
 
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(Error::PacmanKey {
-                status: status.code().unwrap_or(-1),
-                stderr: "refresh failed".to_string(),
-            });
-        }
-
-        callback(RefreshProgress::Completed);
         Ok(())
     }
 
