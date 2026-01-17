@@ -11,7 +11,8 @@ categories = ["os::linux-apis"]
 [dependencies]
 chrono = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["process", "io-util", "rt", "time"] }
+tokio = { version = "1", features = ["process", "io-util", "rt", "time", "macros"] }
+tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]

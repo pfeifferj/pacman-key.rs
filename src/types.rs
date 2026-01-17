@@ -1,4 +1,5 @@
 use chrono::NaiveDate;
+pub use tokio_util::sync::CancellationToken;
 
 /// Status of keyring initialization.
 ///
@@ -139,6 +140,9 @@ pub struct RefreshOptions {
     /// Timeout for the entire refresh operation, in seconds.
     /// If None, no timeout is applied.
     pub timeout_secs: Option<u64>,
+    /// Cancellation token for aborting the operation.
+    /// When cancelled, the subprocess is terminated and `Error::Cancelled` is returned.
+    pub cancel_token: Option<CancellationToken>,
 }
 
 #[cfg(test)]
