@@ -36,6 +36,9 @@ mod validation;
 pub use error::{Error, Result};
 pub use keyring::{Keyring, ReadOnlyKeyring};
 pub use types::{
-    CancellationToken, InitializationStatus, Key, KeyType, KeyValidity, RefreshOptions,
+    CancellationToken, InitializationStatus, Key, KeyType, KeyValidity, OperationOptions,
     RefreshProgress, Signature,
 };
+
+#[allow(deprecated)]
+pub use types::RefreshOptions;
