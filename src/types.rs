@@ -134,16 +134,25 @@ pub enum RefreshProgress {
     },
 }
 
-/// Options for the key refresh operation.
+/// Options for long-running operations like init, populate, and refresh.
+///
+/// Provides timeout and cancellation support for operations that spawn
+/// subprocesses which may take significant time to complete.
+///
+/// Note: A `timeout_secs` of 0 is treated as "no timeout".
 #[derive(Debug, Clone, Default)]
-pub struct RefreshOptions {
-    /// Timeout for the entire refresh operation, in seconds.
-    /// If None, no timeout is applied.
+pub struct OperationOptions {
+    /// Timeout for the operation, in seconds.
+    /// If None or 0, no timeout is applied.
     pub timeout_secs: Option<u64>,
     /// Cancellation token for aborting the operation.
     /// When cancelled, the subprocess is terminated and `Error::Cancelled` is returned.
     pub cancel_token: Option<CancellationToken>,
 }
+
+/// Type alias for backwards compatibility with earlier API.
+#[deprecated(since = "0.2.0", note = "Use OperationOptions instead")]
+pub type RefreshOptions = OperationOptions;
 
 #[cfg(test)]
 mod tests {

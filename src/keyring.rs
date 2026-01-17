@@ -5,7 +5,7 @@ use tokio::process::Command;
 use crate::error::{Error, Result};
 use crate::parse::{parse_keys, parse_signatures};
 use crate::types::{
-    CancellationToken, InitializationStatus, Key, RefreshOptions, RefreshProgress, Signature,
+    CancellationToken, InitializationStatus, Key, OperationOptions, RefreshProgress, Signature,
 };
 use crate::validation::{validate_keyid, validate_keyring_name};
 
@@ -285,6 +285,79 @@ impl Keyring {
         Ok(())
     }
 
+    async fn run_pacman_key_with_options(
+        &self,
+        args: &[&str],
+        options: OperationOptions,
+    ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = Command::new("pacman-key")
+            .env("LC_ALL", "C")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        // Spawn task to consume stderr concurrently (avoids empty buffer after wait)
+        let stderr = child.stderr.take().ok_or(Error::StderrCaptureFailed)?;
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_end(&mut buf).await;
+            buf
+        });
+
+        // Treat timeout_secs=0 as no timeout
+        let timeout_secs = options.timeout_secs.filter(|&s| s > 0);
+        let deadline =
+            timeout_secs.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+
+        let wait_result = match (deadline, &options.cancel_token) {
+            (Some(dl), Some(token)) => {
+                tokio::select! {
+                    _ = token.cancelled() => Err(Error::Cancelled),
+                    _ = tokio::time::sleep_until(dl) => Err(Error::Timeout(timeout_secs.unwrap())),
+                    result = child.wait() => result.map_err(Error::Command),
+                }
+            }
+            (Some(dl), None) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(dl) => Err(Error::Timeout(timeout_secs.unwrap())),
+                    result = child.wait() => result.map_err(Error::Command),
+                }
+            }
+            (None, Some(token)) => {
+                tokio::select! {
+                    _ = token.cancelled() => Err(Error::Cancelled),
+                    result = child.wait() => result.map_err(Error::Command),
+                }
+            }
+            (None, None) => child.wait().await.map_err(Error::Command),
+        };
+
+        // Get stderr output (will be available even if process exited)
+        let stderr_buf = stderr_task.await.unwrap_or_default();
+
+        match wait_result {
+            Ok(status) => {
+                if !status.success() {
+                    return Err(self.check_error(status, &stderr_buf));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(kill_err) = child.start_kill() {
+                    tracing::warn!("failed to kill subprocess: {}", kill_err);
+                }
+                if let Err(wait_err) = child.wait().await {
+                    tracing::warn!("failed to wait for subprocess: {}", wait_err);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Lists all keys in the keyring.
     ///
     /// # Example
@@ -322,27 +395,55 @@ impl Keyring {
     /// Initializes the pacman keyring.
     ///
     /// Creates the keyring directory and generates a local signing key.
+    /// For timeout/cancellation support, use [`init_keyring_with_options`].
+    ///
+    /// [`init_keyring_with_options`]: Self::init_keyring_with_options
     pub async fn init_keyring(&self) -> Result<()> {
-        self.run_pacman_key(&["--init"]).await
+        self.init_keyring_with_options(OperationOptions::default())
+            .await
+    }
+
+    /// Initializes the pacman keyring with timeout and cancellation support.
+    ///
+    /// Creates the keyring directory and generates a local signing key.
+    pub async fn init_keyring_with_options(&self, options: OperationOptions) -> Result<()> {
+        self.run_pacman_key_with_options(&["--init"], options).await
     }
 
     /// Populates the keyring with keys from distribution keyrings.
     ///
     /// If no keyrings are specified, defaults to "archlinux". Keyring names
     /// must contain only alphanumeric characters, hyphens, or underscores.
+    /// For timeout/cancellation support, use [`populate_with_options`].
+    ///
+    /// [`populate_with_options`]: Self::populate_with_options
     pub async fn populate(&self, keyrings: &[&str]) -> Result<()> {
+        self.populate_with_options(keyrings, OperationOptions::default())
+            .await
+    }
+
+    /// Populates the keyring with timeout and cancellation support.
+    ///
+    /// If no keyrings are specified, defaults to "archlinux". Keyring names
+    /// must contain only alphanumeric characters, hyphens, or underscores.
+    pub async fn populate_with_options(
+        &self,
+        keyrings: &[&str],
+        options: OperationOptions,
+    ) -> Result<()> {
         for name in keyrings {
             validate_keyring_name(name)?;
         }
 
-        let keyring_args: &[&str] = if keyrings.is_empty() {
-            &["archlinux"]
+        let keyring_args: Vec<&str> = if keyrings.is_empty() {
+            vec!["archlinux"]
         } else {
-            keyrings
+            keyrings.to_vec()
         };
 
-        self.run_pacman_key(std::iter::once("--populate").chain(keyring_args.iter().copied()))
-            .await
+        let args: Vec<&str> = std::iter::once("--populate").chain(keyring_args).collect();
+
+        self.run_pacman_key_with_options(&args, options).await
     }
 
     /// Receives keys from a keyserver.
@@ -386,11 +487,11 @@ impl Keyring {
     ///
     /// ```no_run
     /// # async fn example() -> pacman_key::Result<()> {
-    /// use pacman_key::{Keyring, RefreshOptions, RefreshProgress, CancellationToken};
+    /// use pacman_key::{Keyring, OperationOptions, RefreshProgress, CancellationToken};
     ///
     /// let keyring = Keyring::new();
     /// let token = CancellationToken::new();
-    /// let options = RefreshOptions {
+    /// let options = OperationOptions {
     ///     timeout_secs: Some(300),
     ///     cancel_token: Some(token.clone()),
     /// };
@@ -400,7 +501,7 @@ impl Keyring {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_keys<F>(&self, callback: F, options: RefreshOptions) -> Result<()>
+    pub async fn refresh_keys<F>(&self, callback: F, options: OperationOptions) -> Result<()>
     where
         F: Fn(RefreshProgress),
     {
