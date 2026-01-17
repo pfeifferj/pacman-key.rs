@@ -392,4 +392,35 @@ tru::1:1400000000:0:3:1:5"#;
         assert_eq!(d.month(), 1);
         assert_eq!(d.day(), 1);
     }
+
+    #[test]
+    fn test_parse_key_with_replacement_character_in_uid() {
+        let output = "pub:f:4096:1:DEADBEEF12345678:1400000000:::-:::scSC::::::23::0:\n\
+            fpr:::::::::FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF:\n\
+            uid:f::::1400000000::HASH::J\u{FFFD}rg M\u{FFFD}ller <jmuller@example.org>::::::::::0:";
+
+        let keys = parse_keys(output).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].uid.contains("rg"));
+        assert!(keys[0].uid.contains("ller"));
+        assert!(keys[0].uid.contains("\u{FFFD}"));
+    }
+
+    #[test]
+    fn test_parse_signature_with_replacement_character_in_uid() {
+        let output =
+            "sig:::1:VALIDKEYID123456:1600000000::::M\u{FFFD}ller <muller@example.org>:10x:::::2:";
+        let sigs = parse_signatures(output).unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert!(sigs[0].uid.contains("ller"));
+        assert!(sigs[0].uid.contains("\u{FFFD}"));
+    }
+
+    #[test]
+    fn test_from_utf8_lossy_replaces_invalid_bytes() {
+        // "Jörg Müller" in Latin-1: ö = 0xF6, ü = 0xFC
+        let invalid_utf8: &[u8] = b"J\xf6rg M\xfcller <jmuller@example.org>";
+        let result = String::from_utf8_lossy(invalid_utf8);
+        assert_eq!(result, "J\u{FFFD}rg M\u{FFFD}ller <jmuller@example.org>");
+    }
 }
