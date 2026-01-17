@@ -1,6 +1,6 @@
 [package]
 name = "pacman-key"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Native Rust interface for managing the pacman keyring on Arch Linux"
 license = "GPL-3.0"
