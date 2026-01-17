@@ -4,7 +4,7 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 use crate::parse::{parse_keys, parse_signatures};
-use crate::types::{Key, RefreshOptions, RefreshProgress, Signature};
+use crate::types::{InitializationStatus, Key, RefreshOptions, RefreshProgress, Signature};
 use crate::validation::{validate_keyid, validate_keyring_name};
 
 const DEFAULT_GPG_HOMEDIR: &str = "/etc/pacman.d/gnupg";
@@ -79,6 +79,103 @@ impl ReadOnlyKeyring {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_signatures(&stdout)
+    }
+
+    /// Checks whether the keyring is initialized without spawning GPG.
+    ///
+    /// Performs filesystem checks to determine the keyring state:
+    /// - Path is not a symlink (security check)
+    /// - Directory exists with correct permissions (700)
+    /// - Contains pubring.kbx or pubring.gpg (non-empty)
+    /// - Contains trustdb.gpg
+    ///
+    /// This is faster than attempting a GPG operation and parsing errors,
+    /// and allows proactive checks before operations.
+    ///
+    /// # Security Considerations
+    ///
+    /// This method performs non-atomic filesystem checks and is subject to
+    /// TOCTOU race conditions. Use for informational purposes, not security
+    /// decisions. Symlinks are rejected to prevent directory traversal attacks.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use pacman_key::{Keyring, InitializationStatus};
+    ///
+    /// let keyring = Keyring::new();
+    /// match keyring.is_initialized() {
+    ///     Ok(InitializationStatus::Ready) => println!("Keyring is ready"),
+    ///     Ok(InitializationStatus::DirectoryMissing) => println!("Run: pacman-key --init"),
+    ///     Ok(InitializationStatus::PathIsSymlink) => println!("Security: path is a symlink"),
+    ///     Ok(status) => println!("Keyring issue: {:?}", status),
+    ///     Err(e) => eprintln!("Check failed: {}", e),
+    /// }
+    /// ```
+    pub fn is_initialized(&self) -> Result<InitializationStatus> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+
+        let dir = Path::new(&self.gpg_homedir);
+
+        // Use symlink_metadata to detect symlinks (doesn't follow them)
+        let metadata = match fs::symlink_metadata(dir) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(InitializationStatus::DirectoryMissing);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(Error::PermissionDenied);
+            }
+            Err(e) => return Err(Error::Command(e)),
+        };
+
+        // Reject symlinks for security
+        if metadata.is_symlink() {
+            return Ok(InitializationStatus::PathIsSymlink);
+        }
+
+        // Check if it's actually a directory
+        if metadata.is_file() {
+            return Ok(InitializationStatus::PathIsFile);
+        }
+
+        if !metadata.is_dir() {
+            return Ok(InitializationStatus::DirectoryMissing);
+        }
+
+        // Check directory permissions (mask off file type and special bits)
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Ok(InitializationStatus::IncorrectPermissions { actual: mode });
+        }
+
+        // Check for keyring files, propagating permission errors
+        let has_pubring = Self::file_exists_and_nonempty(&dir.join("pubring.kbx"))?
+            || Self::file_exists_and_nonempty(&dir.join("pubring.gpg"))?;
+        if !has_pubring {
+            return Ok(InitializationStatus::NoKeyringFiles);
+        }
+
+        if !Self::file_exists_and_nonempty(&dir.join("trustdb.gpg"))? {
+            return Ok(InitializationStatus::NoTrustDb);
+        }
+
+        Ok(InitializationStatus::Ready)
+    }
+
+    fn file_exists_and_nonempty(path: &std::path::Path) -> Result<bool> {
+        use std::fs;
+
+        match fs::metadata(path) {
+            Ok(m) => Ok(m.is_file() && m.len() > 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(Error::PermissionDenied)
+            }
+            Err(e) => Err(Error::Command(e)),
+        }
     }
 }
 
@@ -211,6 +308,13 @@ impl Keyring {
     /// Otherwise lists all signatures in the keyring.
     pub async fn list_signatures(&self, keyid: Option<&str>) -> Result<Vec<Signature>> {
         self.reader.list_signatures(keyid).await
+    }
+
+    /// Checks whether the keyring is initialized without spawning GPG.
+    ///
+    /// See [`ReadOnlyKeyring::is_initialized`] for details.
+    pub fn is_initialized(&self) -> Result<InitializationStatus> {
+        self.reader.is_initialized()
     }
 
     /// Initializes the pacman keyring.
@@ -453,5 +557,205 @@ mod tests {
             }
             _ => panic!("expected PacmanKey error"),
         }
+    }
+
+    #[test]
+    fn test_is_initialized_directory_missing() {
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: "/nonexistent/path/that/does/not/exist".to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::DirectoryMissing);
+    }
+
+    #[test]
+    fn test_is_initialized_no_keyring_files() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_no_keyring");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::NoKeyringFiles);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_no_trustdb() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_no_trustdb");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut f = fs::File::create(tmp.join("pubring.kbx")).unwrap();
+        f.write_all(b"data").unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::NoTrustDb);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_incorrect_permissions() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_bad_perms");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::File::create(tmp.join("pubring.kbx"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+        fs::File::create(tmp.join("trustdb.gpg"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(
+            status,
+            InitializationStatus::IncorrectPermissions { actual: 0o755 }
+        );
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_ready() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_ready");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::File::create(tmp.join("pubring.kbx"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+        fs::File::create(tmp.join("trustdb.gpg"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::Ready);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_with_legacy_pubring() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_legacy");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::File::create(tmp.join("pubring.gpg"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+        fs::File::create(tmp.join("trustdb.gpg"))
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::Ready);
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_path_is_file() {
+        use std::fs;
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_is_file");
+        let _ = fs::remove_file(&tmp);
+        fs::File::create(&tmp).unwrap().write_all(b"data").unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::PathIsFile);
+
+        fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_path_is_symlink() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        let target = std::env::temp_dir().join("pacman_key_test_symlink_target");
+        let link = std::env::temp_dir().join("pacman_key_test_symlink");
+
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_file(&link);
+
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: link.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::PathIsSymlink);
+
+        fs::remove_file(&link).unwrap();
+        fs::remove_dir(&target).unwrap();
+    }
+
+    #[test]
+    fn test_is_initialized_empty_files_treated_as_missing() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = std::env::temp_dir().join("pacman_key_test_empty_files");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::File::create(tmp.join("pubring.kbx")).unwrap();
+        fs::File::create(tmp.join("trustdb.gpg")).unwrap();
+
+        let reader = ReadOnlyKeyring {
+            gpg_homedir: tmp.to_string_lossy().to_string(),
+        };
+        let status = reader.is_initialized().unwrap();
+        assert_eq!(status, InitializationStatus::NoKeyringFiles);
+
+        fs::remove_dir_all(&tmp).unwrap();
     }
 }

@@ -35,4 +35,6 @@ mod validation;
 
 pub use error::{Error, Result};
 pub use keyring::{Keyring, ReadOnlyKeyring};
-pub use types::{Key, KeyType, KeyValidity, RefreshOptions, RefreshProgress, Signature};
+pub use types::{
+    InitializationStatus, Key, KeyType, KeyValidity, RefreshOptions, RefreshProgress, Signature,
+};
