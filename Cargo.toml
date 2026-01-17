@@ -1,0 +1,18 @@
+[package]
+name = "pacman-key"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust interface for managing the pacman keyring on Arch Linux"
+license = "GPL-3.0"
+repository = "https://github.com/pfeifferj/pacman-key-rs"
+keywords = ["archlinux", "pacman", "gpg", "keyring"]
+categories = ["os::linux-apis"]
+
+[dependencies]
+chrono = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["process", "io-util", "rt", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
