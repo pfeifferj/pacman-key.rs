@@ -135,11 +135,7 @@ impl ReadOnlyKeyring {
     /// Returns a [`VerifyResult`]; a bad signature is reported via
     /// `good == false`, not an error. Only an inability to run gpg or read the
     /// signature file produces an `Err`.
-    pub async fn verify_signature(
-        &self,
-        sig: &Path,
-        file: Option<&Path>,
-    ) -> Result<VerifyResult> {
+    pub async fn verify_signature(&self, sig: &Path, file: Option<&Path>) -> Result<VerifyResult> {
         let bytes = std::fs::read(sig).map_err(Error::Command)?;
         if bytes
             .windows(b"BEGIN PGP SIGNATURE".len())
@@ -170,7 +166,9 @@ impl ReadOnlyKeyring {
             .output()
             .await?;
 
-        Ok(parse_verify_status(&String::from_utf8_lossy(&output.stdout)))
+        Ok(parse_verify_status(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 
     /// Reads owner-trust assignments via `gpg --export-ownertrust`.
@@ -545,11 +543,7 @@ impl Keyring {
     /// Verifies a signature against the keyring.
     ///
     /// See [`ReadOnlyKeyring::verify_signature`].
-    pub async fn verify_signature(
-        &self,
-        sig: &Path,
-        file: Option<&Path>,
-    ) -> Result<VerifyResult> {
+    pub async fn verify_signature(&self, sig: &Path, file: Option<&Path>) -> Result<VerifyResult> {
         self.reader.verify_signature(sig, file).await
     }
 

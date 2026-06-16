@@ -5,8 +5,10 @@ edition = "2024"
 description = "Native Rust interface for managing the pacman keyring on Arch Linux"
 license = "GPL-3.0"
 repository = "https://github.com/pfeifferj/pacman-key-rs"
+documentation = "https://docs.rs/pacman-key"
 keywords = ["archlinux", "pacman", "gpg", "keyring"]
 categories = ["os::linux-apis"]
+exclude = ["Makefile", ".pre-commit-config.yaml"]
 
 [dependencies]
 chrono = "0.4"

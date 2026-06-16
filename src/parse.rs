@@ -176,10 +176,20 @@ fn parse_algorithm(code: &str) -> String {
 
 /// Parses the algorithm/created/expires/usage fields shared by `pub` and `sub`
 /// records. Returns `(key_type, created, expires, usage)`.
-fn parse_key_common(fields: &[&str]) -> (Option<KeyType>, Option<NaiveDate>, Option<NaiveDate>, KeyUsage) {
+fn parse_key_common(
+    fields: &[&str],
+) -> (
+    Option<KeyType>,
+    Option<NaiveDate>,
+    Option<NaiveDate>,
+    KeyUsage,
+) {
     let key_type = if fields.len() > 2 {
         let bits = fields[2].parse().unwrap_or(0);
-        let algorithm = fields.get(3).map(|s| parse_algorithm(s)).unwrap_or_default();
+        let algorithm = fields
+            .get(3)
+            .map(|s| parse_algorithm(s))
+            .unwrap_or_default();
         Some(KeyType { algorithm, bits })
     } else {
         None
@@ -375,7 +385,10 @@ uid:r::::1400000000::HASH::Revoked User <revoked@example.org>::::::::::0:"#;
 
         // Second entry has no subkeys; its primary fpr stays correct.
         assert!(keys[1].subkeys.is_empty());
-        assert_eq!(keys[1].fingerprint, "ABAF11C65A2970B130ABE3C479BE3E4300411886");
+        assert_eq!(
+            keys[1].fingerprint,
+            "ABAF11C65A2970B130ABE3C479BE3E4300411886"
+        );
     }
 
     #[test]
@@ -392,7 +405,10 @@ uid:r::::1400000000::HASH::Revoked User <revoked@example.org>::::::::::0:"#;
             r.key_fpr.as_deref(),
             Some("ABAF11C65A2970B130ABE3C479BE3E4300411886")
         );
-        assert_eq!(r.uid.as_deref(), Some("Levente Polyak <anthraxx@archlinux.org>"));
+        assert_eq!(
+            r.uid.as_deref(),
+            Some("Levente Polyak <anthraxx@archlinux.org>")
+        );
     }
 
     #[test]
