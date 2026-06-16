@@ -15,9 +15,6 @@ pub enum Error {
     #[error("invalid keyring name '{name}': {reason}")]
     InvalidKeyringName { name: String, reason: String },
 
-    #[error("key not found: {0}")]
-    KeyNotFound(String),
-
     #[error("keyring not initialized")]
     KeyringNotInitialized,
 
@@ -29,9 +26,6 @@ pub enum Error {
 
     #[error("operation was cancelled")]
     Cancelled,
-
-    #[error("failed to capture stderr from subprocess")]
-    StderrCaptureFailed,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

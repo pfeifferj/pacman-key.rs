@@ -1,5 +1,4 @@
 use chrono::NaiveDate;
-use tracing::debug;
 
 use crate::error::Result;
 use crate::types::{Key, KeyType, KeyValidity, Signature};
@@ -16,12 +15,10 @@ pub fn parse_keys(output: &str) -> Result<Vec<Key>> {
 
         match fields[0] {
             "pub" => {
-                if let Some(builder) = current_key.take() {
-                    if let Some(key) = builder.build() {
-                        keys.push(key);
-                    } else {
-                        debug!("skipping key: missing required fields (fingerprint or key_type)");
-                    }
+                if let Some(builder) = current_key.take()
+                    && let Some(key) = builder.build()
+                {
+                    keys.push(key);
                 }
                 current_key = Some(KeyBuilder::from_pub_fields(&fields));
             }
@@ -41,25 +38,14 @@ pub fn parse_keys(output: &str) -> Result<Vec<Key>> {
                     builder.uid = Some(fields[9].to_string());
                 }
             }
-            "sub" | "ssb" | "uat" | "rev" | "tru" => {
-                debug!(
-                    record_type = fields[0],
-                    "skipping unhandled GPG record type"
-                );
-            }
-            _ if !fields[0].is_empty() => {
-                debug!(record_type = fields[0], "skipping unknown GPG record type");
-            }
             _ => {}
         }
     }
 
-    if let Some(builder) = current_key {
-        if let Some(key) = builder.build() {
-            keys.push(key);
-        } else {
-            debug!("skipping final key: missing required fields (fingerprint or key_type)");
-        }
+    if let Some(builder) = current_key
+        && let Some(key) = builder.build()
+    {
+        keys.push(key);
     }
 
     Ok(keys)
@@ -77,7 +63,6 @@ pub fn parse_signatures(output: &str) -> Result<Vec<Signature>> {
         if fields.len() > 9 {
             let keyid = fields.get(4).unwrap_or(&"");
             if keyid.is_empty() {
-                debug!("skipping signature with empty keyid");
                 continue;
             }
 
@@ -106,14 +91,11 @@ fn parse_timestamp(s: &str) -> Option<NaiveDate> {
 
 fn parse_algorithm(code: &str) -> String {
     match code {
-        "1" => "RSA".to_string(),
-        "2" => "RSA".to_string(),
-        "3" => "RSA".to_string(),
-        "16" => "Elgamal".to_string(),
+        "1" | "2" | "3" => "RSA".to_string(),
+        "16" | "20" => "Elgamal".to_string(),
         "17" => "DSA".to_string(),
         "18" => "ECDH".to_string(),
         "19" => "ECDSA".to_string(),
-        "20" => "Elgamal".to_string(),
         "22" => "EdDSA".to_string(),
         _ => format!("ALG{}", code),
     }

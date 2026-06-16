@@ -198,6 +198,36 @@ fn check_gpg_error(homedir: &str, status: std::process::ExitStatus, stderr: &[u8
     }
 }
 
+/// Awaits `fut`, racing it against an optional timeout and cancellation token.
+/// Returns `Err(Timeout)`/`Err(Cancelled)` if either fires first, else the future's output.
+async fn with_deadline<F, T>(
+    fut: F,
+    deadline: Option<tokio::time::Instant>,
+    timeout_secs: u64,
+    cancel_token: &Option<CancellationToken>,
+) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let timeout = async {
+        match deadline {
+            Some(dl) => tokio::time::sleep_until(dl).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let cancel = async {
+        match cancel_token {
+            Some(t) => t.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = cancel => Err(Error::Cancelled),
+        _ = timeout => Err(Error::Timeout(timeout_secs)),
+        out = fut => Ok(out),
+    }
+}
+
 /// Interface for managing the pacman keyring.
 ///
 /// Provides async methods for key listing, importing, signing, and keyring management.
@@ -300,7 +330,7 @@ impl Keyring {
             .spawn()?;
 
         // Spawn task to consume stderr concurrently (avoids empty buffer after wait)
-        let stderr = child.stderr.take().ok_or(Error::StderrCaptureFailed)?;
+        let stderr = child.stderr.take().expect("stderr is piped");
         let stderr_task = tokio::spawn(async move {
             let mut buf = Vec::new();
             let mut stderr = stderr;
@@ -313,28 +343,14 @@ impl Keyring {
         let deadline =
             timeout_secs.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
 
-        let wait_result = match (deadline, &options.cancel_token) {
-            (Some(dl), Some(token)) => {
-                tokio::select! {
-                    _ = token.cancelled() => Err(Error::Cancelled),
-                    _ = tokio::time::sleep_until(dl) => Err(Error::Timeout(timeout_secs.unwrap())),
-                    result = child.wait() => result.map_err(Error::Command),
-                }
-            }
-            (Some(dl), None) => {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(dl) => Err(Error::Timeout(timeout_secs.unwrap())),
-                    result = child.wait() => result.map_err(Error::Command),
-                }
-            }
-            (None, Some(token)) => {
-                tokio::select! {
-                    _ = token.cancelled() => Err(Error::Cancelled),
-                    result = child.wait() => result.map_err(Error::Command),
-                }
-            }
-            (None, None) => child.wait().await.map_err(Error::Command),
-        };
+        let wait_result = with_deadline(
+            child.wait(),
+            deadline,
+            timeout_secs.unwrap_or(0),
+            &options.cancel_token,
+        )
+        .await
+        .and_then(|r| r.map_err(Error::Command));
 
         // Get stderr output (will be available even if process exited)
         let stderr_buf = stderr_task.await.unwrap_or_default();
@@ -348,10 +364,10 @@ impl Keyring {
             }
             Err(e) => {
                 if let Err(kill_err) = child.start_kill() {
-                    tracing::warn!("failed to kill subprocess: {}", kill_err);
+                    eprintln!("pacman-key: failed to kill subprocess: {}", kill_err);
                 }
                 if let Err(wait_err) = child.wait().await {
-                    tracing::warn!("failed to wait for subprocess: {}", wait_err);
+                    eprintln!("pacman-key: failed to wait for subprocess: {}", wait_err);
                 }
                 Err(e)
             }
@@ -505,22 +521,8 @@ impl Keyring {
     where
         F: Fn(RefreshProgress),
     {
-        let timeout_duration = options.timeout_secs.map(std::time::Duration::from_secs);
         let cancel_token = options.cancel_token;
 
-        self.refresh_keys_inner(&callback, timeout_duration, cancel_token)
-            .await
-    }
-
-    async fn refresh_keys_inner<F>(
-        &self,
-        callback: &F,
-        timeout: Option<std::time::Duration>,
-        cancel_token: Option<CancellationToken>,
-    ) -> Result<()>
-    where
-        F: Fn(RefreshProgress),
-    {
         let keys = self.list_keys().await?;
         let total = keys.len();
 
@@ -533,16 +535,17 @@ impl Keyring {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        let stderr = child.stderr.take().ok_or(Error::StderrCaptureFailed)?;
+        let stderr = child.stderr.take().expect("stderr is piped");
         let mut reader = BufReader::new(stderr);
 
-        let timeout_secs = timeout.map(|d| d.as_secs());
-        let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+        let timeout_secs = options.timeout_secs;
+        let deadline =
+            timeout_secs.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
 
         let result = self
             .read_refresh_output(
                 &mut reader,
-                callback,
+                &callback,
                 total,
                 deadline,
                 timeout_secs,
@@ -555,10 +558,10 @@ impl Keyring {
 
         if result.is_err() {
             if let Err(e) = child.start_kill() {
-                tracing::warn!("failed to kill subprocess: {}", e);
+                eprintln!("pacman-key: failed to kill subprocess: {}", e);
             }
             if let Err(e) = child.wait().await {
-                tracing::warn!("failed to wait for subprocess: {}", e);
+                eprintln!("pacman-key: failed to wait for subprocess: {}", e);
             }
             return result;
         }
@@ -593,32 +596,13 @@ impl Keyring {
         loop {
             buf.clear();
 
-            let read_result = match (deadline, cancel_token) {
-                (Some(dl), Some(token)) => {
-                    tokio::select! {
-                        _ = token.cancelled() => return Err(Error::Cancelled),
-                        _ = tokio::time::sleep_until(dl) => {
-                            return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
-                        }
-                        result = reader.read_until(b'\n', &mut buf) => result,
-                    }
-                }
-                (Some(dl), None) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(dl) => {
-                            return Err(Error::Timeout(timeout_secs.unwrap_or(0)));
-                        }
-                        result = reader.read_until(b'\n', &mut buf) => result,
-                    }
-                }
-                (None, Some(token)) => {
-                    tokio::select! {
-                        _ = token.cancelled() => return Err(Error::Cancelled),
-                        result = reader.read_until(b'\n', &mut buf) => result,
-                    }
-                }
-                (None, None) => reader.read_until(b'\n', &mut buf).await,
-            };
+            let read_result = with_deadline(
+                reader.read_until(b'\n', &mut buf),
+                deadline,
+                timeout_secs.unwrap_or(0),
+                cancel_token,
+            )
+            .await?;
 
             match read_result {
                 Ok(0) => break,

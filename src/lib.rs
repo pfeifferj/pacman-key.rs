@@ -39,6 +39,3 @@ pub use types::{
     CancellationToken, InitializationStatus, Key, KeyType, KeyValidity, OperationOptions,
     RefreshProgress, Signature,
 };
-
-#[allow(deprecated)]
-pub use types::RefreshOptions;

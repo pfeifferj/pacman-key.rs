@@ -67,7 +67,7 @@ impl std::fmt::Display for KeyType {
 /// confused with owner trust (how much we trust the key owner to sign other keys).
 ///
 /// Values correspond to GPG's validity field in `--with-colons` output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum KeyValidity {
     /// Validity unknown (new key or insufficient data)
@@ -149,10 +149,6 @@ pub struct OperationOptions {
     /// When cancelled, the subprocess is terminated and `Error::Cancelled` is returned.
     pub cancel_token: Option<CancellationToken>,
 }
-
-/// Type alias for backwards compatibility with earlier API.
-#[deprecated(since = "0.2.0", note = "Use OperationOptions instead")]
-pub type RefreshOptions = OperationOptions;
 
 #[cfg(test)]
 mod tests {
