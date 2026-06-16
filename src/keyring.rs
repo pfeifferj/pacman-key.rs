@@ -1,13 +1,15 @@
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
-use crate::parse::{parse_keys, parse_signatures};
+use crate::parse::{parse_keys, parse_ownertrust, parse_signatures, parse_verify_status};
 use crate::types::{
-    CancellationToken, InitializationStatus, Key, OperationOptions, RefreshProgress, Signature,
+    CancellationToken, InitializationStatus, Key, OperationOptions, OwnerTrust, RefreshProgress,
+    Signature, VerifyResult,
 };
-use crate::validation::{validate_keyid, validate_keyring_name};
+use crate::validation::{validate_keyid, validate_keyring_name, validate_path};
 
 const DEFAULT_GPG_HOMEDIR: &str = "/etc/pacman.d/gnupg";
 
@@ -33,12 +35,17 @@ pub struct ReadOnlyKeyring {
 }
 
 impl ReadOnlyKeyring {
-    /// Lists all keys in the keyring.
-    pub async fn list_keys(&self) -> Result<Vec<Key>> {
+    /// Runs `gpg --homedir=<dir>` with the given args, returning raw stdout on
+    /// success or a mapped error on non-zero exit.
+    async fn run_gpg<I, S>(&self, args: I) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let output = Command::new("gpg")
             .env("LC_ALL", "C")
             .arg(format!("--homedir={}", self.gpg_homedir))
-            .args(["--list-keys", "--with-colons"])
+            .args(args)
             .output()
             .await?;
 
@@ -50,37 +57,126 @@ impl ReadOnlyKeyring {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_keys(&stdout)
+        Ok(output.stdout)
     }
 
-    /// Lists signatures on keys in the keyring.
+    /// Lists all keys in the keyring.
+    pub async fn list_keys(&self) -> Result<Vec<Key>> {
+        let stdout = self.run_gpg(["--list-keys", "--with-colons"]).await?;
+        parse_keys(&String::from_utf8_lossy(&stdout))
+    }
+
+    /// Lists signatures on keys in the keyring (non-checking `--list-sigs`).
     ///
     /// If `keyid` is provided, lists signatures only for that key.
-    /// Otherwise lists all signatures in the keyring.
+    /// Otherwise lists all signatures in the keyring. The `status` field of
+    /// each [`Signature`] is `None`; use [`check_signatures`] to verify them.
+    ///
+    /// [`check_signatures`]: Self::check_signatures
     pub async fn list_signatures(&self, keyid: Option<&str>) -> Result<Vec<Signature>> {
-        let mut cmd = Command::new("gpg");
-        cmd.env("LC_ALL", "C")
-            .arg(format!("--homedir={}", self.gpg_homedir))
-            .args(["--list-sigs", "--with-colons"]);
+        self.run_list_sigs("--list-sigs", keyid).await
+    }
 
+    /// Lists and verifies signatures on keys (`--check-sigs`).
+    ///
+    /// Like [`list_signatures`] but each [`Signature`]'s `status` is populated
+    /// with the verification result.
+    ///
+    /// [`list_signatures`]: Self::list_signatures
+    pub async fn check_signatures(&self, keyid: Option<&str>) -> Result<Vec<Signature>> {
+        self.run_list_sigs("--check-sigs", keyid).await
+    }
+
+    async fn run_list_sigs(&self, op: &str, keyid: Option<&str>) -> Result<Vec<Signature>> {
+        let mut args = vec![op.to_string(), "--with-colons".to_string()];
         if let Some(id) = keyid {
-            let validated = validate_keyid(id)?;
-            cmd.arg(validated);
+            args.push(validate_keyid(id)?);
+        }
+        let stdout = self.run_gpg(args).await?;
+        parse_signatures(&String::from_utf8_lossy(&stdout))
+    }
+
+    /// Exports the given keys as an ASCII-armored block.
+    ///
+    /// An empty `keyids` slice exports all public keys. Mirrors
+    /// `pacman-key --export`.
+    pub async fn export_keys(&self, keyids: &[&str]) -> Result<String> {
+        let mut args = vec!["--armor".to_string(), "--export".to_string()];
+        for id in keyids {
+            args.push(validate_keyid(id)?);
+        }
+        let stdout = self.run_gpg(args).await?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    /// Returns the fingerprints of the given keys (or all keys if empty).
+    ///
+    /// Mirrors `pacman-key --finger`. Note [`list_keys`] already returns the
+    /// same fingerprints alongside the full key data; this is a convenience
+    /// for when only fingerprints are needed.
+    ///
+    /// [`list_keys`]: Self::list_keys
+    pub async fn fingerprints(&self, keyids: &[&str]) -> Result<Vec<String>> {
+        let mut args = vec!["--with-colons".to_string(), "--fingerprint".to_string()];
+        for id in keyids {
+            args.push(validate_keyid(id)?);
+        }
+        let stdout = self.run_gpg(args).await?;
+        let keys = parse_keys(&String::from_utf8_lossy(&stdout))?;
+        Ok(keys.into_iter().map(|k| k.fingerprint).collect())
+    }
+
+    /// Verifies a signature against the keyring.
+    ///
+    /// `sig` is the (binary) signature file; `file` is the signed data for a
+    /// detached signature (omit for an embedded one). Mirrors
+    /// `pacman-key --verify`, which rejects ASCII-armored signatures.
+    ///
+    /// Returns a [`VerifyResult`]; a bad signature is reported via
+    /// `good == false`, not an error. Only an inability to run gpg or read the
+    /// signature file produces an `Err`.
+    pub async fn verify_signature(
+        &self,
+        sig: &Path,
+        file: Option<&Path>,
+    ) -> Result<VerifyResult> {
+        let bytes = std::fs::read(sig).map_err(Error::Command)?;
+        if bytes
+            .windows(b"BEGIN PGP SIGNATURE".len())
+            .any(|w| w == b"BEGIN PGP SIGNATURE")
+        {
+            return Err(Error::InvalidPath {
+                path: sig.display().to_string(),
+                reason: "armored signatures are not supported (use a binary signature)".to_string(),
+            });
         }
 
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
-            return Err(check_gpg_error(
-                &self.gpg_homedir,
-                output.status,
-                &output.stderr,
-            ));
+        let mut args = vec![
+            "--status-fd".to_string(),
+            "1".to_string(),
+            "--verify".to_string(),
+            validate_path(sig)?.to_string(),
+        ];
+        if let Some(f) = file {
+            args.push(validate_path(f)?.to_string());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_signatures(&stdout)
+        // gpg exits non-zero on a bad/untrusted signature; that is a verdict,
+        // not a failure, so capture stdout regardless of exit status.
+        let output = Command::new("gpg")
+            .env("LC_ALL", "C")
+            .arg(format!("--homedir={}", self.gpg_homedir))
+            .args(&args)
+            .output()
+            .await?;
+
+        Ok(parse_verify_status(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// Reads owner-trust assignments via `gpg --export-ownertrust`.
+    pub async fn get_ownertrust(&self) -> Result<Vec<(String, OwnerTrust)>> {
+        let stdout = self.run_gpg(["--export-ownertrust"]).await?;
+        Ok(parse_ownertrust(&String::from_utf8_lossy(&stdout)))
     }
 
     /// Checks whether the keyring is initialized without spawning GPG.
@@ -198,6 +294,15 @@ fn check_gpg_error(homedir: &str, status: std::process::ExitStatus, stderr: &[u8
     }
 }
 
+/// Builds a `pacman-key` arg vector from an operation flag and validated paths.
+fn paths_to_args(flag: &str, paths: &[&Path]) -> Result<Vec<String>> {
+    let mut args = vec![flag.to_string()];
+    for p in paths {
+        args.push(validate_path(p)?.to_string());
+    }
+    Ok(args)
+}
+
 /// Awaits `fut`, racing it against an optional timeout and cancellation token.
 /// Returns `Err(Timeout)`/`Err(Cancelled)` if either fires first, else the future's output.
 async fn with_deadline<F, T>(
@@ -254,6 +359,7 @@ where
 /// ```
 pub struct Keyring {
     reader: ReadOnlyKeyring,
+    keyserver: Option<String>,
 }
 
 impl Default for Keyring {
@@ -270,7 +376,21 @@ impl Keyring {
             reader: ReadOnlyKeyring {
                 gpg_homedir: DEFAULT_GPG_HOMEDIR.to_string(),
             },
+            keyserver: None,
         }
+    }
+
+    /// Sets the keyserver used by [`receive_keys`] and [`refresh_keys`].
+    ///
+    /// Maps to pacman-key's `--keyserver`. When unset, gpg's configured
+    /// default keyserver is used.
+    ///
+    /// [`receive_keys`]: Self::receive_keys
+    /// [`refresh_keys`]: Self::refresh_keys
+    #[must_use]
+    pub fn with_keyserver(mut self, url: impl Into<String>) -> Self {
+        self.keyserver = Some(url.into());
+        self
     }
 
     /// Creates a read-only keyring interface for a custom GPG home directory.
@@ -393,12 +513,51 @@ impl Keyring {
         self.reader.list_keys().await
     }
 
-    /// Lists signatures on keys in the keyring.
+    /// Lists signatures on keys in the keyring (non-checking `--list-sigs`).
     ///
     /// If `keyid` is provided, lists signatures only for that key.
     /// Otherwise lists all signatures in the keyring.
     pub async fn list_signatures(&self, keyid: Option<&str>) -> Result<Vec<Signature>> {
         self.reader.list_signatures(keyid).await
+    }
+
+    /// Lists and verifies signatures on keys (`--check-sigs`).
+    ///
+    /// See [`ReadOnlyKeyring::check_signatures`].
+    pub async fn check_signatures(&self, keyid: Option<&str>) -> Result<Vec<Signature>> {
+        self.reader.check_signatures(keyid).await
+    }
+
+    /// Exports the given keys (or all keys) as an ASCII-armored block.
+    ///
+    /// See [`ReadOnlyKeyring::export_keys`].
+    pub async fn export_keys(&self, keyids: &[&str]) -> Result<String> {
+        self.reader.export_keys(keyids).await
+    }
+
+    /// Returns the fingerprints of the given keys (or all keys).
+    ///
+    /// See [`ReadOnlyKeyring::fingerprints`].
+    pub async fn fingerprints(&self, keyids: &[&str]) -> Result<Vec<String>> {
+        self.reader.fingerprints(keyids).await
+    }
+
+    /// Verifies a signature against the keyring.
+    ///
+    /// See [`ReadOnlyKeyring::verify_signature`].
+    pub async fn verify_signature(
+        &self,
+        sig: &Path,
+        file: Option<&Path>,
+    ) -> Result<VerifyResult> {
+        self.reader.verify_signature(sig, file).await
+    }
+
+    /// Reads owner-trust assignments.
+    ///
+    /// See [`ReadOnlyKeyring::get_ownertrust`].
+    pub async fn get_ownertrust(&self) -> Result<Vec<(String, OwnerTrust)>> {
+        self.reader.get_ownertrust().await
     }
 
     /// Checks whether the keyring is initialized without spawning GPG.
@@ -464,6 +623,20 @@ impl Keyring {
 
     /// Receives keys from a keyserver.
     pub async fn receive_keys(&self, keyids: &[&str]) -> Result<()> {
+        self.receive_keys_with_options(keyids, OperationOptions::default())
+            .await
+    }
+
+    /// Receives keys from a keyserver with timeout and cancellation support.
+    ///
+    /// Uses the keyserver set via [`with_keyserver`], if any.
+    ///
+    /// [`with_keyserver`]: Self::with_keyserver
+    pub async fn receive_keys_with_options(
+        &self,
+        keyids: &[&str],
+        options: OperationOptions,
+    ) -> Result<()> {
         if keyids.is_empty() {
             return Ok(());
         }
@@ -473,8 +646,16 @@ impl Keyring {
             .map(|k| validate_keyid(k))
             .collect::<Result<_>>()?;
 
-        self.run_pacman_key(std::iter::once("--recv-keys".to_string()).chain(validated))
-            .await
+        let mut args: Vec<String> = Vec::new();
+        if let Some(ks) = &self.keyserver {
+            args.push("--keyserver".to_string());
+            args.push(ks.clone());
+        }
+        args.push("--recv-keys".to_string());
+        args.extend(validated);
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_pacman_key_with_options(&arg_refs, options).await
     }
 
     /// Locally signs a key to mark it as trusted.
@@ -487,6 +668,113 @@ impl Keyring {
     pub async fn delete_key(&self, keyid: &str) -> Result<()> {
         let validated = validate_keyid(keyid)?;
         self.run_pacman_key(&["--delete", &validated]).await
+    }
+
+    /// Imports keys from file(s) into the keyring (`pacman-key --add`).
+    ///
+    /// Distinct from [`receive_keys`], which pulls from a keyserver. Each path
+    /// must exist. pacman-key updates the trust database afterward; this crate
+    /// does not, so call [`update_trustdb`] when trust state must be current.
+    ///
+    /// [`receive_keys`]: Self::receive_keys
+    /// [`update_trustdb`]: Self::update_trustdb
+    pub async fn add_keys(&self, files: &[&Path]) -> Result<()> {
+        self.add_keys_with_options(files, OperationOptions::default())
+            .await
+    }
+
+    /// Imports keys from file(s) with timeout and cancellation support.
+    pub async fn add_keys_with_options(
+        &self,
+        files: &[&Path],
+        options: OperationOptions,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let args = paths_to_args("--add", files)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run_pacman_key_with_options(&arg_refs, options).await
+    }
+
+    /// Rebuilds the trust database (`pacman-key --updatedb`,
+    /// i.e. `gpg --check-trustdb`).
+    ///
+    /// pacman-key runs this automatically after every key-mutating operation;
+    /// this crate leaves it to the caller. Run it after `add_keys`,
+    /// `delete_key`, `locally_sign_key`, `receive_keys`, or `set_ownertrust`
+    /// to keep computed validity current.
+    pub async fn update_trustdb(&self) -> Result<()> {
+        self.update_trustdb_with_options(OperationOptions::default())
+            .await
+    }
+
+    /// Rebuilds the trust database with timeout and cancellation support.
+    pub async fn update_trustdb_with_options(&self, options: OperationOptions) -> Result<()> {
+        self.run_pacman_key_with_options(&["--updatedb"], options)
+            .await
+    }
+
+    /// Imports `pubring.gpg` from one or more keyring directories
+    /// (`pacman-key --import`).
+    pub async fn import_keyrings(&self, dirs: &[&Path]) -> Result<()> {
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        self.run_pacman_key(paths_to_args("--import", dirs)?).await
+    }
+
+    /// Imports owner-trust values from `trustdb.gpg` in one or more keyring
+    /// directories (`pacman-key --import-trustdb`).
+    pub async fn import_trustdb(&self, dirs: &[&Path]) -> Result<()> {
+        if dirs.is_empty() {
+            return Ok(());
+        }
+        self.run_pacman_key(paths_to_args("--import-trustdb", dirs)?)
+            .await
+    }
+
+    /// Sets owner-trust levels for keys, non-interactively.
+    ///
+    /// A scriptable replacement for the trust submenu of `--edit-key`: feeds
+    /// `<fingerprint>:<level>:` lines to `gpg --import-ownertrust`. Each keyid
+    /// is validated. Run [`update_trustdb`] afterward to recompute validity.
+    ///
+    /// [`update_trustdb`]: Self::update_trustdb
+    pub async fn set_ownertrust(&self, entries: &[(&str, OwnerTrust)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::new();
+        for (keyid, trust) in entries {
+            let fpr = validate_keyid(keyid)?;
+            input.push_str(&format!("{}:{}:\n", fpr, trust.to_gpg_level()));
+        }
+        self.run_gpg_stdin(&["--import-ownertrust"], input.as_bytes())
+            .await
+    }
+
+    async fn run_gpg_stdin(&self, args: &[&str], input: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = Command::new("gpg")
+            .env("LC_ALL", "C")
+            .arg(format!("--homedir={}", self.reader.gpg_homedir))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input).await.map_err(Error::Command)?;
+        }
+
+        let output = child.wait_with_output().await.map_err(Error::Command)?;
+        if !output.status.success() {
+            return Err(self.check_error(output.status, &output.stderr));
+        }
+        Ok(())
     }
 
     /// Refreshes all keys from the keyserver.
@@ -528,8 +816,12 @@ impl Keyring {
 
         callback(RefreshProgress::Starting { total_keys: total });
 
-        let mut child = Command::new("pacman-key")
-            .env("LC_ALL", "C")
+        let mut cmd = Command::new("pacman-key");
+        cmd.env("LC_ALL", "C");
+        if let Some(ks) = &self.keyserver {
+            cmd.arg("--keyserver").arg(ks);
+        }
+        let mut child = cmd
             .arg("--refresh-keys")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

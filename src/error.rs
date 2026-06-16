@@ -15,6 +15,9 @@ pub enum Error {
     #[error("invalid keyring name '{name}': {reason}")]
     InvalidKeyringName { name: String, reason: String },
 
+    #[error("invalid path '{path}': {reason}")]
+    InvalidPath { path: String, reason: String },
+
     #[error("keyring not initialized")]
     KeyringNotInitialized,
 

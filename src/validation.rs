@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::error::{Error, Result};
 
 /// Validates a keyring name before passing to subprocess.
@@ -68,6 +70,27 @@ pub fn validate_keyid(keyid: &str) -> Result<String> {
             reason: format!("key ID must be 8, 16, or 40 hex characters (got {})", len),
         }),
     }
+}
+
+/// Validates that a path exists and is valid UTF-8 before passing to a
+/// subprocess. Returns the path as `&str` on success.
+///
+/// The existence check is non-atomic (TOCTOU); the subprocess is the real
+/// gate. This only gives a clearer error than a raw gpg failure.
+pub fn validate_path(path: &Path) -> Result<&str> {
+    let s = path.to_str().ok_or_else(|| Error::InvalidPath {
+        path: path.display().to_string(),
+        reason: "path must be valid UTF-8".to_string(),
+    })?;
+
+    if !path.exists() {
+        return Err(Error::InvalidPath {
+            path: s.to_string(),
+            reason: "path does not exist".to_string(),
+        });
+    }
+
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -167,5 +190,13 @@ mod tests {
     fn test_invalid_contains_spaces() {
         let err = validate_keyid("DEAD BEEF").unwrap_err();
         assert!(matches!(err, Error::InvalidKeyId { .. }));
+    }
+
+    #[test]
+    fn test_validate_path_exists() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(validate_path(Path::new(manifest)).is_ok());
+        let err = validate_path(Path::new("/nonexistent/pacman-key/xyz")).unwrap_err();
+        assert!(matches!(err, Error::InvalidPath { .. }));
     }
 }

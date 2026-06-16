@@ -1,7 +1,9 @@
 use chrono::NaiveDate;
 
 use crate::error::Result;
-use crate::types::{Key, KeyType, KeyValidity, Signature};
+use crate::types::{
+    Key, KeyType, KeyUsage, KeyValidity, OwnerTrust, SigStatus, Signature, Subkey, VerifyResult,
+};
 
 pub fn parse_keys(output: &str) -> Result<Vec<Key>> {
     let mut keys = Vec::new();
@@ -16,24 +18,26 @@ pub fn parse_keys(output: &str) -> Result<Vec<Key>> {
         match fields[0] {
             "pub" => {
                 if let Some(builder) = current_key.take()
-                    && let Some(key) = builder.build()
+                    && let Some(key) = builder.finish()
                 {
                     keys.push(key);
                 }
                 current_key = Some(KeyBuilder::from_pub_fields(&fields));
             }
-            "fpr" if current_key.is_some() => {
-                if let Some(ref mut builder) = current_key
-                    && builder.fingerprint.is_none()
-                    && fields.len() > 9
-                {
-                    builder.fingerprint = Some(fields[9].to_string());
+            "sub" => {
+                if let Some(ref mut builder) = current_key {
+                    builder.take_sub();
+                    builder.pending_sub = Some(SubkeyBuilder::from_sub_fields(&fields));
                 }
             }
-            "uid" if current_key.is_some() => {
+            "fpr" if fields.len() > 9 => {
+                if let Some(ref mut builder) = current_key {
+                    builder.set_fpr(fields[9]);
+                }
+            }
+            "uid" if fields.len() > 9 => {
                 if let Some(ref mut builder) = current_key
                     && builder.uid.is_none()
-                    && fields.len() > 9
                 {
                     builder.uid = Some(fields[9].to_string());
                 }
@@ -43,12 +47,80 @@ pub fn parse_keys(output: &str) -> Result<Vec<Key>> {
     }
 
     if let Some(builder) = current_key
-        && let Some(key) = builder.build()
+        && let Some(key) = builder.finish()
     {
         keys.push(key);
     }
 
     Ok(keys)
+}
+
+/// Parses GPG's machine-readable `--status-fd` output from a `--verify` run.
+pub fn parse_verify_status(output: &str) -> VerifyResult {
+    let mut result = VerifyResult {
+        good: false,
+        trusted: false,
+        key_fpr: None,
+        uid: None,
+    };
+
+    for line in output.lines() {
+        let Some(rest) = line.strip_prefix("[GNUPG:] ") else {
+            continue;
+        };
+        let mut parts = rest.split(' ');
+        match parts.next() {
+            Some("GOODSIG") => {
+                result.good = true;
+                let _keyid = parts.next();
+                let name: Vec<&str> = parts.collect();
+                if !name.is_empty() {
+                    result.uid = Some(name.join(" "));
+                }
+            }
+            Some("VALIDSIG") => {
+                result.good = true;
+                if let Some(fpr) = parts.next() {
+                    result.key_fpr = Some(fpr.to_string());
+                }
+            }
+            Some("TRUST_FULLY" | "TRUST_ULTIMATE") => result.trusted = true,
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/// Parses `gpg --export-ownertrust` output into (fingerprint, trust) pairs.
+pub fn parse_ownertrust(output: &str) -> Vec<(String, OwnerTrust)> {
+    output
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| {
+            let mut parts = l.split(':');
+            let fpr = parts.next()?;
+            let level = parts.next()?;
+            if fpr.is_empty() {
+                return None;
+            }
+            Some((fpr.to_string(), OwnerTrust::from_gpg_level(level)))
+        })
+        .collect()
+}
+
+fn parse_usage(caps: &str) -> KeyUsage {
+    let mut usage = KeyUsage::default();
+    for c in caps.chars() {
+        match c {
+            's' => usage.sign = true,
+            'c' => usage.certify = true,
+            'e' => usage.encrypt = true,
+            'a' => usage.authenticate = true,
+            _ => {}
+        }
+    }
+    usage
 }
 
 pub fn parse_signatures(output: &str) -> Result<Vec<Signature>> {
@@ -72,6 +144,7 @@ pub fn parse_signatures(output: &str) -> Result<Vec<Signature>> {
                 expires: fields.get(6).and_then(|s| parse_timestamp(s)),
                 uid: fields.get(9).unwrap_or(&"").to_string(),
                 sig_class: fields.get(10).unwrap_or(&"").to_string(),
+                status: SigStatus::from_gpg_marker(fields.get(1).unwrap_or(&"")),
             });
         }
     }
@@ -101,6 +174,22 @@ fn parse_algorithm(code: &str) -> String {
     }
 }
 
+/// Parses the algorithm/created/expires/usage fields shared by `pub` and `sub`
+/// records. Returns `(key_type, created, expires, usage)`.
+fn parse_key_common(fields: &[&str]) -> (Option<KeyType>, Option<NaiveDate>, Option<NaiveDate>, KeyUsage) {
+    let key_type = if fields.len() > 2 {
+        let bits = fields[2].parse().unwrap_or(0);
+        let algorithm = fields.get(3).map(|s| parse_algorithm(s)).unwrap_or_default();
+        Some(KeyType { algorithm, bits })
+    } else {
+        None
+    };
+    let created = fields.get(5).and_then(|s| parse_timestamp(s));
+    let expires = fields.get(6).and_then(|s| parse_timestamp(s));
+    let usage = fields.get(11).map(|s| parse_usage(s)).unwrap_or_default();
+    (key_type, created, expires, usage)
+}
+
 #[derive(Default)]
 struct KeyBuilder {
     fingerprint: Option<String>,
@@ -109,41 +198,54 @@ struct KeyBuilder {
     expires: Option<NaiveDate>,
     validity: KeyValidity,
     key_type: Option<KeyType>,
+    usage: KeyUsage,
+    subkeys: Vec<Subkey>,
+    pending_sub: Option<SubkeyBuilder>,
 }
 
 impl KeyBuilder {
     fn from_pub_fields(fields: &[&str]) -> Self {
-        let mut builder = Self::default();
+        let validity = fields
+            .get(1)
+            .and_then(|s| s.chars().next())
+            .map(KeyValidity::from_gpg_char)
+            .unwrap_or_default();
+        let (key_type, created, expires, usage) = parse_key_common(fields);
 
-        if fields.len() > 1 {
-            builder.validity = fields[1]
-                .chars()
-                .next()
-                .map(KeyValidity::from_gpg_char)
-                .unwrap_or_default();
+        Self {
+            validity,
+            key_type,
+            created,
+            expires,
+            usage,
+            ..Self::default()
         }
-
-        if fields.len() > 2 {
-            let bits = fields[2].parse().unwrap_or(0);
-            let algorithm = fields
-                .get(3)
-                .map(|s| parse_algorithm(s))
-                .unwrap_or_default();
-            builder.key_type = Some(KeyType { algorithm, bits });
-        }
-
-        if fields.len() > 5 {
-            builder.created = parse_timestamp(fields[5]);
-        }
-
-        if fields.len() > 6 {
-            builder.expires = parse_timestamp(fields[6]);
-        }
-
-        builder
     }
 
-    fn build(self) -> Option<Key> {
+    /// Routes an `fpr` record to the pending subkey if one is open, else to the
+    /// primary key.
+    fn set_fpr(&mut self, fpr: &str) {
+        if let Some(ref mut sub) = self.pending_sub
+            && sub.fingerprint.is_none()
+        {
+            sub.fingerprint = Some(fpr.to_string());
+            return;
+        }
+        if self.fingerprint.is_none() {
+            self.fingerprint = Some(fpr.to_string());
+        }
+    }
+
+    fn take_sub(&mut self) {
+        if let Some(sub) = self.pending_sub.take()
+            && let Some(built) = sub.build()
+        {
+            self.subkeys.push(built);
+        }
+    }
+
+    fn finish(mut self) -> Option<Key> {
+        self.take_sub();
         Some(Key {
             fingerprint: self.fingerprint?,
             uid: self.uid.unwrap_or_default(),
@@ -151,6 +253,40 @@ impl KeyBuilder {
             expires: self.expires,
             validity: self.validity,
             key_type: self.key_type?,
+            usage: self.usage,
+            subkeys: self.subkeys,
+        })
+    }
+}
+
+#[derive(Default)]
+struct SubkeyBuilder {
+    fingerprint: Option<String>,
+    key_type: Option<KeyType>,
+    created: Option<NaiveDate>,
+    expires: Option<NaiveDate>,
+    usage: KeyUsage,
+}
+
+impl SubkeyBuilder {
+    fn from_sub_fields(fields: &[&str]) -> Self {
+        let (key_type, created, expires, usage) = parse_key_common(fields);
+        Self {
+            key_type,
+            created,
+            expires,
+            usage,
+            ..Self::default()
+        }
+    }
+
+    fn build(self) -> Option<Subkey> {
+        Some(Subkey {
+            fingerprint: self.fingerprint?,
+            key_type: self.key_type?,
+            created: self.created,
+            expires: self.expires,
+            usage: self.usage,
         })
     }
 }
@@ -219,6 +355,88 @@ uid:r::::1400000000::HASH::Revoked User <revoked@example.org>::::::::::0:"#;
         let keys = parse_keys(output).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].validity, KeyValidity::Revoked);
+    }
+
+    #[test]
+    fn test_parse_subkeys_and_usage() {
+        let keys = parse_keys(SAMPLE_KEY_OUTPUT).unwrap();
+
+        // Primary key of the first entry has sign+certify (scSC).
+        assert!(keys[0].usage.sign);
+        assert!(keys[0].usage.certify);
+        assert!(!keys[0].usage.encrypt);
+
+        // First entry has one subkey (s) with its own fingerprint.
+        assert_eq!(keys[0].subkeys.len(), 1);
+        let sub = &keys[0].subkeys[0];
+        assert_eq!(sub.fingerprint, "BAE40BD8DC8BDAAA11DCFF68B31FB30B04D73EB0");
+        assert!(sub.usage.sign);
+        assert!(!sub.usage.certify);
+
+        // Second entry has no subkeys; its primary fpr stays correct.
+        assert!(keys[1].subkeys.is_empty());
+        assert_eq!(keys[1].fingerprint, "ABAF11C65A2970B130ABE3C479BE3E4300411886");
+    }
+
+    #[test]
+    fn test_parse_verify_good_trusted() {
+        let output = "\
+[GNUPG:] NEWSIG
+[GNUPG:] GOODSIG 786C63F330D7CB92 Levente Polyak <anthraxx@archlinux.org>
+[GNUPG:] VALIDSIG ABAF11C65A2970B130ABE3C479BE3E4300411886 2024-01-01 1704067200 0 4 0 22 8 01 ABAF11C65A2970B130ABE3C479BE3E4300411886
+[GNUPG:] TRUST_ULTIMATE 0 pgp";
+        let r = parse_verify_status(output);
+        assert!(r.good);
+        assert!(r.trusted);
+        assert_eq!(
+            r.key_fpr.as_deref(),
+            Some("ABAF11C65A2970B130ABE3C479BE3E4300411886")
+        );
+        assert_eq!(r.uid.as_deref(), Some("Levente Polyak <anthraxx@archlinux.org>"));
+    }
+
+    #[test]
+    fn test_parse_verify_bad() {
+        let output = "[GNUPG:] BADSIG 786C63F330D7CB92 Someone <a@b.org>";
+        let r = parse_verify_status(output);
+        assert!(!r.good);
+        assert!(!r.trusted);
+    }
+
+    #[test]
+    fn test_parse_verify_good_untrusted() {
+        let output = "\
+[GNUPG:] GOODSIG DEADBEEF12345678 Untrusted <u@example.org>
+[GNUPG:] VALIDSIG AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2024-01-01 1704067200 0 4 0 22
+[GNUPG:] TRUST_UNDEFINED 0 pgp";
+        let r = parse_verify_status(output);
+        assert!(r.good);
+        assert!(!r.trusted);
+    }
+
+    #[test]
+    fn test_parse_ownertrust() {
+        let output = "\
+# comment line
+ABAF11C65A2970B130ABE3C479BE3E4300411886:6:
+6645B0A8C7005E78DB1D7864F99FFE0FEAE999BD:4:
+
+";
+        let trust = parse_ownertrust(output);
+        assert_eq!(trust.len(), 2);
+        assert_eq!(trust[0].1, OwnerTrust::Ultimate);
+        assert_eq!(trust[1].1, OwnerTrust::Marginal);
+    }
+
+    #[test]
+    fn test_parse_check_sigs_status() {
+        let output = "\
+sig:!::1:786C63F330D7CB92:1568815794::::Levente Polyak <anthraxx@archlinux.org>:13x:::::8:
+sig:?::1:DEADBEEF12345678:1568815794::::[User ID not found]:10x:::::8:";
+        let sigs = parse_signatures(output).unwrap();
+        assert_eq!(sigs.len(), 2);
+        assert_eq!(sigs[0].status, Some(SigStatus::Good));
+        assert_eq!(sigs[1].status, Some(SigStatus::MissingKey));
     }
 
     #[test]
