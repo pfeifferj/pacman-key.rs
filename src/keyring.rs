@@ -415,6 +415,10 @@ impl Keyring {
         }
     }
 
+    pub fn get_homedir(&self) -> &str {
+        &self.reader.gpg_homedir
+    }
+
     async fn run_pacman_key<I, S>(&self, args: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
@@ -926,7 +930,7 @@ impl Keyring {
     }
 
     fn check_error(&self, status: std::process::ExitStatus, stderr: &[u8]) -> Error {
-        check_gpg_error(&self.reader.gpg_homedir, status, stderr)
+        check_gpg_error(self.get_homedir(), status, stderr)
     }
 }
 
