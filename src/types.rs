@@ -23,17 +23,13 @@ pub enum InitializationStatus {
     DirectoryMissing,
     /// Path exists but is a regular file, not a directory.
     PathIsFile,
-    /// Path is a symbolic link (security risk - may point to untrusted location).
-    PathIsSymlink,
     /// Directory exists but contains no keyring files (pubring.kbx or pubring.gpg).
     NoKeyringFiles,
     /// Directory exists but trustdb.gpg is missing.
     NoTrustDb,
-    /// Directory exists but has incorrect permissions (should be 700).
-    IncorrectPermissions {
-        /// The actual permission bits (e.g., 0o755).
-        actual: u32,
-    },
+    /// Directory exists but has incorrect permissions
+    /// (`pacman-key --init` creates it 755).
+    IncorrectPermissions { actual: u32 },
 }
 
 /// A GPG key from the pacman keyring.
